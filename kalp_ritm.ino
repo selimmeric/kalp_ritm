@@ -1,85 +1,55 @@
 #include <Wire.h>
 #include <Adafruit_PWMServoDriver.h>
-#include <tinyCommand.hpp>
+#include <LittleFS.h> // DOSYA SİSTEMİ İÇİN EKLENDİ
 
-// PCA9685 ayarları
-#define PWM_FREQUENCY 1000 // Hz cinsinden PWM frekansı
+#define PWM_FREQUENCY 1000
 Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver();
 
-// Sabitler
 #define MIN_BPM 40
 #define MAX_BPM 140
-#define NUM_VALVES 16 // PCA9685 ile 16 kanal destekleniyor
-#define DEFAULT_PULSE_LENGTH 50 // Varsayılan atış süresi (ms)
+#define NUM_VALVES 16
+#define CONFIG_FILE "/settings.json" // Ayar dosyamızın adı
 
-// Durumlar
-enum ControlMode {
-  MANUAL_PWM,
-  HEART_RHYTHM
-};
+enum ControlMode { MANUAL_PWM, HEART_RHYTHM };
+enum PQRST_State { STATE_IDLE, STATE_P_WAVE, STATE_PR_SEGMENT, STATE_R_WAVE, STATE_ST_SEGMENT, STATE_T_WAVE };
 
-// Valf Kontrol Yapısı
 struct ValveControl {
-  uint8_t channel; // PCA9685 kanal numarası (0-15)
-  ControlMode mode;
-  unsigned long lastBeatTime;
-  unsigned long beatInterval;
-  int heartRate;
-  int pwmValue;
-  unsigned long manualPulseDuration;
-  bool useDynamicPulse;
-  int lastDutyCycle;
-  bool debug;
+  uint8_t channel; ControlMode mode; bool state; int pwmValue; int heartRate; unsigned long beatInterval;
+  unsigned long lastBeatTime; int lastDutyCycle; bool debug; bool useDynamicPulse; unsigned int manualPulseDuration;
+  bool usePQRST; PQRST_State pqrstState; unsigned long lastPqrstEventTime; unsigned int pWaveDuration, prSegmentDuration, rWaveDuration, stSegmentDuration, tWaveDuration;
+  unsigned int pWavePwm, rWavePwm, tWavePwm;
 };
 
-// Valf Dizisi
 ValveControl valves[NUM_VALVES];
-
-// tinyCommand nesnesi
-static tinyCommand cmd(Serial);
-
 void setSolenoidDuty(uint8_t channel, int dutyCycle);
 
-#include "WebInterface.h"
+// Prototip bildirimleri
+void saveSettings();
+void loadSettings();
+
+#include "webinterface.h"
+
 void setup() {
   Serial.begin(115200);
-  Serial.println("PCA9685 ile 16 Valf Kontrol Sistemi");
+  Serial.println("Ayarlanabilir PQRST Kontrol Sistemi - Kalici Hafiza Aktif");
   
-  // PCA9685 başlatma
+  // LittleFS'i başlat
+  if (!LittleFS.begin(true)) {
+    Serial.println("LittleFS baslatilamadi!");
+    return;
+  }
+  Serial.println("LittleFS baslatildi.");
+
   pwm.begin();
   pwm.setPWMFreq(PWM_FREQUENCY);
-  
-  cmd.begin();
-  cmd.setCmd("valf", set_valf_komutu);
-  cmd.setCmd("pwm", set_pwm);
-  cmd.setCmd("bpm", set_bpm);
-  cmd.setCmd("mode", set_mode);
-  cmd.setCmd("pdur", set_pulse_duration);
-  cmd.setCmd("pdmode", set_pulse_mode);
-  cmd.setCmd("debug", set_debug);
 
-  // Valf başlangıç ayarları
-  for (int i = 0; i < NUM_VALVES; i++) {
-    valves[i].channel = i;
-    valves[i].mode = MANUAL_PWM;
-    valves[i].lastBeatTime = 0;
-    valves[i].beatInterval = 60000 / 60; // 60 BPM varsayılan
-    valves[i].heartRate = 60;
-    valves[i].pwmValue = 0;
-    valves[i].manualPulseDuration = DEFAULT_PULSE_LENGTH;
-    valves[i].useDynamicPulse = true;
-    valves[i].lastDutyCycle = -1;
-    valves[i].debug = false;
-    
-    // Başlangıçta tüm valfler kapalı
-    setSolenoidDuty(i, 0);
-  }
+  // Ayarları dosyadan yükle, eğer dosya yoksa varsayılanları kullan ve dosyayı oluştur.
+  loadSettings(); 
 
   setupWebInterface();
 }
 
 void loop() {
-  cmd.scan();
   handleWebRequests();
   for (int i = 0; i < NUM_VALVES; i++) {
     handleHeartRhythm(i);
@@ -87,320 +57,142 @@ void loop() {
   delay(1);
 }
 
-void setSolenoidDuty(uint8_t channel, int dutyCycle) {
-  if (dutyCycle < 0) dutyCycle = 0;
-  if (dutyCycle > 4095) dutyCycle = 4095; // PCA9685 12-bit çözünürlük
-  
-  pwm.setPWM(channel, 0, dutyCycle);
-  
-  if (dutyCycle != valves[channel].lastDutyCycle) {
-    if (valves[channel].debug) {
-      Serial.print("Valf ");
-      Serial.print(channel + 1);
-      Serial.print(" (Kanal ");
-      Serial.print(channel);
-      Serial.print(") duty cycle: ");
-      Serial.println(dutyCycle);
+void saveSettings() {
+  StaticJsonDocument<8192> doc; // Dinamik yerine büyük bir Statik JSON belgesi kullanıyoruz (8KB)
+  JsonArray valvesArray = doc["valves"].to<JsonArray>();
+  for (int i = 0; i < NUM_VALVES; i++) {
+    JsonObject v = valvesArray.add<JsonObject>();
+    // ... (tüm atamalar aynı)
+    v["state"] = valves[i].state; v["mode"] = valves[i].mode; v["pwmValue"] = valves[i].pwmValue;
+    v["heartRate"] = valves[i].heartRate; v["useDynamicPulse"] = valves[i].useDynamicPulse;
+    v["manualPulseDuration"] = valves[i].manualPulseDuration; v["usePQRST"] = valves[i].usePQRST;
+    v["pWaveDuration"] = valves[i].pWaveDuration; v["prSegmentDuration"] = valves[i].prSegmentDuration;
+    v["rWaveDuration"] = valves[i].rWaveDuration; v["stSegmentDuration"] = valves[i].stSegmentDuration;
+    v["tWaveDuration"] = valves[i].tWaveDuration; v["pWavePwm"] = valves[i].pWavePwm;
+    v["rWavePwm"] = valves[i].rWavePwm; v["tWavePwm"] = valves[i].tWavePwm;
+  }
+
+  File configFile = LittleFS.open(CONFIG_FILE, "w");
+  if (!configFile) {
+    Serial.println("Ayar dosyasi kaydedilemedi!");
+    return;
+  }
+  if (serializeJson(doc, configFile) == 0) {
+    Serial.println("JSON dosyaya yazilamadi.");
+  } else {
+    Serial.println("Ayarlar basariyla kaydedildi.");
+  }
+  configFile.close();
+}
+
+void loadSettings() {
+  if (LittleFS.exists(CONFIG_FILE)) {
+    File configFile = LittleFS.open(CONFIG_FILE, "r");
+    if (!configFile) {
+      Serial.println("Ayar dosyasi acilamadi!");
+      return;
     }
+    StaticJsonDocument<8192> doc; // Okurken de büyük Statik belge kullan
+    DeserializationError error = deserializeJson(doc, configFile);
+    configFile.close();
+    if (error) {
+      Serial.print("JSON parse hatasi: ");
+      Serial.println(error.c_str());
+      return;
+    }
+
+    JsonArray valvesArray = doc["valves"];
+    for (int i = 0; i < NUM_VALVES; i++) {
+      JsonObject v = valvesArray[i];
+      valves[i].state = v["state"]; valves[i].mode = v["mode"]; valves[i].pwmValue = v["pwmValue"];
+      valves[i].heartRate = v["heartRate"]; valves[i].useDynamicPulse = v["useDynamicPulse"];
+      valves[i].manualPulseDuration = v["manualPulseDuration"]; valves[i].usePQRST = v["usePQRST"];
+      valves[i].pWaveDuration = v["pWaveDuration"]; valves[i].prSegmentDuration = v["prSegmentDuration"];
+      valves[i].rWaveDuration = v["rWaveDuration"]; valves[i].stSegmentDuration = v["stSegmentDuration"];
+      valves[i].tWaveDuration = v["tWaveDuration"]; valves[i].pWavePwm = v["pWavePwm"];
+      valves[i].rWavePwm = v["rWavePwm"]; valves[i].tWavePwm = v["tWavePwm"];
+      valves[i].beatInterval = 60000 / valves[i].heartRate;
+      valves[i].channel = i;
+    }
+    Serial.println("Ayarlar dosyadan basariyla yuklendi.");
+  } else {
+    Serial.println("Ayar dosyasi bulunamadi. Varsayilan ayarlar kullaniliyor ve yeni dosya olusturuluyor.");
+    // Varsayılan değerleri ata (setup içindeki gibi)
+    for (int i = 0; i < NUM_VALVES; i++) {
+        valves[i] = {
+          .channel = (uint8_t)i, .mode = MANUAL_PWM, .state = false,
+          .pwmValue = 0, .heartRate = 60, .beatInterval = 1000, .lastBeatTime = 0, .lastDutyCycle = -1, .debug = false,
+          .useDynamicPulse = true, .manualPulseDuration = 50, .usePQRST = false, .pqrstState = STATE_IDLE, .lastPqrstEventTime = 0,
+          .pWaveDuration = 80, .prSegmentDuration = 70, .rWaveDuration = 100, .stSegmentDuration = 100, .tWaveDuration = 160,
+          .pWavePwm = 40, .rWavePwm = 100, .tWavePwm = 60
+        };
+    }
+    saveSettings(); // Varsayılanları dosyaya kaydet
+  }
+}
+
+// handleHeartRhythm ve diğer fonksiyonlar öncekiyle aynı...
+void setSolenoidDuty(uint8_t channel, int dutyCycle) {
+  dutyCycle = constrain(dutyCycle, 0, 4095);
+  if (dutyCycle != valves[channel].lastDutyCycle) {
+    pwm.setPWM(channel, 0, dutyCycle);
     valves[channel].lastDutyCycle = dutyCycle;
   }
 }
-
 void handleHeartRhythm(int valveIndex) {
-  static unsigned long pulseStartTime[NUM_VALVES] = {0};
-  static bool isPulsing[NUM_VALVES] = {false};
-  
   unsigned long currentTime = millis();
-  unsigned long minPulseDuration = 20; // Minimum atış süresi (ms)
-  unsigned long dynamicPulseDuration;
-  unsigned long currentPulseDuration;
-  
   ValveControl &valve = valves[valveIndex];
-
-  if (valve.mode == HEART_RHYTHM) {
-    if (valve.useDynamicPulse) {
-      dynamicPulseDuration = max(minPulseDuration, valve.beatInterval / 4);
-      currentPulseDuration = dynamicPulseDuration;
-    } else {
-      currentPulseDuration = valve.manualPulseDuration;
+  if (!valve.state || valve.mode != HEART_RHYTHM) {
+    if (valve.pqrstState != STATE_IDLE) {
+        setSolenoidDuty(valve.channel, 0);
+        valve.pqrstState = STATE_IDLE;
     }
-
-    if (currentTime - valve.lastBeatTime >= valve.beatInterval) {
-      if (valve.debug) {
-        Serial.print("Valf ");
-        Serial.print(valveIndex + 1);
-        Serial.println(" >>> BEAT! <<<");
-      }
-      setSolenoidDuty(valve.channel, valve.pwmValue);
-      valve.lastBeatTime = currentTime;
-      pulseStartTime[valveIndex] = currentTime;
-      isPulsing[valveIndex] = true;
+    return;
+  }
+  if (valve.usePQRST) {
+    if (valve.pqrstState == STATE_IDLE && (currentTime - valve.lastBeatTime >= valve.beatInterval)) {
+      valve.lastBeatTime = currentTime; valve.pqrstState = STATE_P_WAVE; valve.lastPqrstEventTime = currentTime;
+      int p_power = (valve.pwmValue * valve.pWavePwm) / 100;
+      setSolenoidDuty(valve.channel, p_power); 
     }
-
+    switch (valve.pqrstState) {
+      case STATE_P_WAVE:
+        if (currentTime - valve.lastPqrstEventTime > valve.pWaveDuration) {
+          setSolenoidDuty(valve.channel, 0); valve.pqrstState = STATE_PR_SEGMENT; valve.lastPqrstEventTime = currentTime;
+        }
+        break;
+      case STATE_PR_SEGMENT:
+        if (currentTime - valve.lastPqrstEventTime > valve.prSegmentDuration) {
+          int r_power = (valve.pwmValue * valve.rWavePwm) / 100;
+          setSolenoidDuty(valve.channel, r_power); valve.pqrstState = STATE_R_WAVE; valve.lastPqrstEventTime = currentTime;
+        }
+        break;
+      case STATE_R_WAVE:
+        if (currentTime - valve.lastPqrstEventTime > valve.rWaveDuration) {
+          setSolenoidDuty(valve.channel, 0); valve.pqrstState = STATE_ST_SEGMENT; valve.lastPqrstEventTime = currentTime;
+        }
+        break;
+      case STATE_ST_SEGMENT:
+        if (currentTime - valve.lastPqrstEventTime > valve.stSegmentDuration) {
+          int t_power = (valve.pwmValue * valve.tWavePwm) / 100;
+          setSolenoidDuty(valve.channel, t_power); valve.pqrstState = STATE_T_WAVE; valve.lastPqrstEventTime = currentTime;
+        }
+        break;
+      case STATE_T_WAVE:
+        if (currentTime - valve.lastPqrstEventTime > valve.tWaveDuration) {
+          setSolenoidDuty(valve.channel, 0); valve.pqrstState = STATE_IDLE;
+        }
+        break;
+      case STATE_IDLE: break;
+    }
+  } else {
+    static unsigned long pulseStartTime[NUM_VALVES] = {0}; static bool isPulsing[NUM_VALVES] = {false};
+    unsigned long currentPulseDuration = valve.useDynamicPulse ? max(20UL, valve.beatInterval / 4) : valve.manualPulseDuration;
+    if (!isPulsing[valveIndex] && (currentTime - valve.lastBeatTime >= valve.beatInterval)) {
+      setSolenoidDuty(valve.channel, valve.pwmValue); valve.lastBeatTime = currentTime; pulseStartTime[valveIndex] = currentTime; isPulsing[valveIndex] = true;
+    }
     if (isPulsing[valveIndex] && (currentTime - pulseStartTime[valveIndex] >= currentPulseDuration)) {
-      if (valve.debug) {
-        Serial.print("Valf ");
-        Serial.print(valveIndex + 1);
-        Serial.println(" <<< END BEAT >>>");
-      }
-      setSolenoidDuty(valve.channel, 0);
-      isPulsing[valveIndex] = false;
+      setSolenoidDuty(valve.channel, 0); isPulsing[valveIndex] = false;
     }
   }
 }
-
-// Komut işleme fonksiyonları (set_valf_komutu, set_pwm, set_bpm vb.) öncekiyle aynı kalacak,
-// sadece pin yerine channel kullanılacak ve 16 valfe uygun hale getirilecek
-
-int16_t set_valf_komutu(int argc, char **argv) {
-  if (argc >= 2) {
-    int valveIndex = strtol(argv[1], NULL, 10) - 1;
-    if (valveIndex >= 0 && valveIndex < NUM_VALVES) {
-      if (argc == 7) {
-        // valf <valf_no> <pwm> <bpm> <mod> <pdur> <pdmode>
-        int pwm_deger = strtol(argv[2], NULL, 10);
-        int bpm_deger = strtol(argv[3], NULL, 10);
-        int pdur_deger = strtol(argv[5], NULL, 10);
-
-        if (pwm_deger >= 0 && pwm_deger <= 4095) {
-          valves[valveIndex].pwmValue = pwm_deger;
-          setSolenoidDuty(valves[valveIndex].channel, pwm_deger);
-          Serial.print("Valf "); Serial.print(valveIndex + 1); 
-          Serial.print(" PWM değerine ayarlandı: "); Serial.println(pwm_deger);
-        } else {
-          Serial.print("Hata (Valf "); Serial.print(valveIndex + 1); 
-          Serial.println("): Geçersiz PWM değeri (0-4095 arasında olmalı).");
-          return 1;
-        }
-
-        if (bpm_deger >= MIN_BPM && bpm_deger <= MAX_BPM) {
-          valves[valveIndex].heartRate = bpm_deger;
-          valves[valveIndex].beatInterval = 60000 / bpm_deger;
-          Serial.print("Valf "); Serial.print(valveIndex + 1); 
-          Serial.print(" Kalp ritmi değerine ayarlandı (BPM: "); 
-          Serial.print(bpm_deger); Serial.println(")");
-        } else {
-          Serial.print("Hata (Valf "); Serial.print(valveIndex + 1); 
-          Serial.print("): Geçersiz BPM değeri ("); 
-          Serial.print(MIN_BPM); Serial.print("-"); 
-          Serial.print(MAX_BPM); Serial.println(" arasında olmalı).");
-          return 1;
-        }
-
-        if (strcmp(argv[4], "m") == 0) {
-          valves[valveIndex].mode = MANUAL_PWM;
-          Serial.print("Valf "); Serial.print(valveIndex + 1); 
-          Serial.println(" Manuel PWM kontrol modu seçildi.");
-        } else if (strcmp(argv[4], "o") == 0) {
-          valves[valveIndex].mode = HEART_RHYTHM;
-          Serial.print("Valf "); Serial.print(valveIndex + 1); 
-          Serial.println(" Kalp ritmi kontrol modu seçildi.");
-        } else {
-          Serial.print("Hata (Valf "); Serial.print(valveIndex + 1); 
-          Serial.println("): Geçersiz çalışma modu ('m' veya 'o').");
-          return 1;
-        }
-
-        if (pdur_deger > 0) {
-          valves[valveIndex].manualPulseDuration = pdur_deger;
-          Serial.print("Valf "); Serial.print(valveIndex + 1); 
-          Serial.print(" Manuel atış süresi ayarlandı (ms): "); 
-          Serial.println(pdur_deger);
-        } else {
-          Serial.print("Hata (Valf "); Serial.print(valveIndex + 1); 
-          Serial.println("): Geçersiz manuel atış süresi.");
-          return 1;
-        }
-
-        if (strcmp(argv[6], "m") == 0) {
-          valves[valveIndex].useDynamicPulse = false;
-          Serial.print("Valf "); Serial.print(valveIndex + 1); 
-          Serial.println(" Manuel atış süresi kullanımı seçildi.");
-        } else if (strcmp(argv[6], "o") == 0) {
-          valves[valveIndex].useDynamicPulse = true;
-          Serial.print("Valf "); Serial.print(valveIndex + 1); 
-          Serial.println(" Otomatik atış süresi kullanımı seçildi.");
-        } else {
-          Serial.print("Hata (Valf "); Serial.print(valveIndex + 1); 
-          Serial.println("): Geçersiz duration modu ('m' veya 'o').");
-          return 1;
-        }
-      } else {
-        Serial.println("Kullanım: valf <valf_no> <pwm_değeri> <bpm> <mod (m|o)> <pdur> <pdmode (m|o)>");
-        Serial.println("Örnek: valf 1 4095 70 o 50 m");
-      }
-    } else {
-      Serial.print("Hata: Geçersiz valf numarası (1-");
-      Serial.print(NUM_VALVES);
-      Serial.println(" arasında olmalı).");
-    }
-  } else {
-    Serial.println("Kullanım: valf <valf_no> ...");
-  }
-  return 1;
-}
-int16_t set_pwm(int argc, char **argv) {
-  if (argc > 2) {
-    int valveIndex = strtol(argv[1], NULL, 10) - 1;
-    int pwmDeğer = strtol(argv[2], NULL, 10);
-    if (valveIndex >= 0 && valveIndex < NUM_VALVES) {
-      if (pwmDeğer >= 0 && pwmDeğer <= 4095) {
-        valves[valveIndex].pwmValue = pwmDeğer;
-        setSolenoidDuty(valves[valveIndex].channel, pwmDeğer);
-        Serial.print("Valf "); Serial.print(valveIndex + 1); 
-        Serial.print(" PWM değerine ayarlandı: "); Serial.println(pwmDeğer);
-      } else {
-        Serial.print("Hata (Valf "); Serial.print(valveIndex + 1); 
-        Serial.println("): Geçersiz PWM değeri (0-4095 arasında olmalı).");
-      }
-      if(argc > 3){
-        if (strcmp(argv[3], "m") == 0) {
-          valves[valveIndex].mode = MANUAL_PWM;
-          Serial.print("Valf "); Serial.print(valveIndex + 1); 
-          Serial.println(" Manuel PWM kontrol modu seçildi.");
-        } else if (strcmp(argv[3], "o") == 0) {
-          valves[valveIndex].mode = HEART_RHYTHM;
-          Serial.print("Valf "); Serial.print(valveIndex + 1); 
-          Serial.println(" Kalp ritmi kontrol modu seçildi.");
-        } else {
-          Serial.print("Hata (Valf "); Serial.print(valveIndex + 1); 
-          Serial.println("): Geçersiz çalışma modu ('m' veya 'o').");
-          return 1;
-        }
-      }
-    } else {
-      Serial.print("Hata: Geçersiz valf numarası (1-"); 
-      Serial.print(NUM_VALVES); Serial.println(" arasında olmalı).");
-    }
-  } else {
-    Serial.println("Kullanım: pwm <valf_no> <duty_cycle> (0-4095) [mod]");
-  }
-  return 1;
-}
-
-int16_t set_bpm(int argc, char **argv) {
-  if (argc > 2) {
-    int valveIndex = strtol(argv[1], NULL, 10) - 1;
-    int bpmDeğer = strtol(argv[2], NULL, 10);
-    if (valveIndex >= 0 && valveIndex < NUM_VALVES) {
-      if (bpmDeğer >= MIN_BPM && bpmDeğer <= MAX_BPM) {
-        valves[valveIndex].heartRate = bpmDeğer;
-        valves[valveIndex].beatInterval = 60000 / bpmDeğer;
-        valves[valveIndex].mode = HEART_RHYTHM;
-        Serial.print("Valf "); Serial.print(valveIndex + 1); 
-        Serial.print(" kalp ritmi modunda (BPM: "); 
-        Serial.print(bpmDeğer); Serial.println(").");
-      } else {
-        Serial.print("Hata (Valf "); Serial.print(valveIndex + 1); 
-        Serial.print("): BPM değeri "); Serial.print(MIN_BPM); 
-        Serial.print(" ile "); Serial.print(MAX_BPM); 
-        Serial.println(" arasında olmalıdır.");
-      }
-    } else {
-      Serial.print("Hata: Geçersiz valf numarası (1-"); 
-      Serial.print(NUM_VALVES); Serial.println(" arasında olmalı).");
-    }
-  } else {
-    Serial.println("Kullanım: bpm <valf_no> <atış_sayısı_dakikada> (40-140)");
-  }
-  return 1;
-}
-
-int16_t set_mode(int argc, char **argv) {
-  if (argc > 2) {
-    int valveIndex = strtol(argv[1], NULL, 10) - 1;
-    if (valveIndex >= 0 && valveIndex < NUM_VALVES) {
-      if (strcmp(argv[2], "m") == 0) {
-        valves[valveIndex].mode = MANUAL_PWM;
-        Serial.print("Valf "); Serial.print(valveIndex + 1); 
-        Serial.println(" manuel PWM moduna geçti.");
-      } else if (strcmp(argv[2], "o") == 0) {
-        valves[valveIndex].mode = HEART_RHYTHM;
-        Serial.print("Valf "); Serial.print(valveIndex + 1); 
-        Serial.println(" kalp ritmi moduna geçti.");
-      } else {
-        Serial.print("Hata (Valf "); Serial.print(valveIndex + 1); 
-        Serial.println("): Geçersiz mod ('m' veya 'o').");
-      }
-    } else {
-      Serial.print("Hata: Geçersiz valf numarası (1-"); 
-      Serial.print(NUM_VALVES); Serial.println(" arasında olmalı).");
-    }
-  } else {
-    Serial.println("Kullanım: mode <valf_no> <m|o>");
-  }
-  return 1;
-}
-
-int16_t set_pulse_duration(int argc, char **argv) {
-  if (argc > 2) {
-    int valveIndex = strtol(argv[1], NULL, 10) - 1;
-    int duration = strtol(argv[2], NULL, 10);
-    if (valveIndex >= 0 && valveIndex < NUM_VALVES) {
-      if (duration > 0) {
-        valves[valveIndex].manualPulseDuration = duration;
-        Serial.print("Valf "); Serial.print(valveIndex + 1); 
-        Serial.print(" manuel atış süresi (ms): "); 
-        Serial.println(valves[valveIndex].manualPulseDuration);
-      } else {
-        Serial.print("Hata (Valf "); Serial.print(valveIndex + 1); 
-        Serial.println("): Geçersiz manuel atış süresi.");
-      }
-    } else {
-      Serial.print("Hata: Geçersiz valf numarası (1-"); 
-      Serial.print(NUM_VALVES); Serial.println(" arasında olmalı).");
-    }
-  } else {
-    Serial.println("Kullanım: pdur <valf_no> <süre_milisaniye>");
-  }
-  return 1;
-}
-
-int16_t set_pulse_mode(int argc, char **argv) {
-  if (argc > 2) {
-    int valveIndex = strtol(argv[1], NULL, 10) - 1;
-    if (valveIndex >= 0 && valveIndex < NUM_VALVES) {
-      if (strcmp(argv[2], "o") == 0) {
-        valves[valveIndex].useDynamicPulse = true;
-        Serial.print("Valf "); Serial.print(valveIndex + 1); 
-        Serial.println(" dinamik atış süresi kullanıyor.");
-      } else if (strcmp(argv[2], "m") == 0) {
-        valves[valveIndex].useDynamicPulse = false;
-        Serial.print("Valf "); Serial.print(valveIndex + 1); 
-        Serial.print(" manuel atış süresi kullanıyor (süre: "); 
-        Serial.print(valves[valveIndex].manualPulseDuration); 
-        Serial.println(" ms).");
-      } else {
-        Serial.print("Hata (Valf "); Serial.print(valveIndex + 1); 
-        Serial.println("): Geçersiz mod ('m' veya 'o').");
-      }
-    } else {
-      Serial.print("Hata: Geçersiz valf numarası (1-"); 
-      Serial.print(NUM_VALVES); Serial.println(" arasında olmalı).");
-    }
-  } else {
-    Serial.println("Kullanım: pdmode <valf_no> <m|o>");
-  }
-  return 1;
-}
-
-int16_t set_debug(int argc, char **argv) {
-  if (argc > 1) {
-    int valveIndex = strtol(argv[1], NULL, 10) - 1;
-    int debug = strtol(argv[2], NULL, 10);
-    if (valveIndex >= 0 && valveIndex < NUM_VALVES) {
-      valves[valveIndex].debug = debug;
-      Serial.print("Valf "); Serial.print(valveIndex + 1); 
-      Serial.print(" debug modu: "); 
-      Serial.println(valves[valveIndex].debug ? "Açık" : "Kapalı");
-    } else {
-      Serial.print("Hata: Geçersiz valf numarası (1-"); 
-      Serial.print(NUM_VALVES); Serial.println(" arasında olmalı).");
-    }
-  } else {
-    Serial.println("Kullanım: debug <valf_no> <0|1>");
-  }
-  return 1;
-}
-// Diğer komut fonksiyonları (set_pwm, set_bpm, set_mode, set_pulse_duration, set_pulse_mode, set_debug)
-// benzer şekilde güncellenerek 16 valf ve PCA9685 desteği eklenebilir
